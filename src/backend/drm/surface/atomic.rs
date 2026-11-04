@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 #[cfg(debug_assertions)]
 use std::fmt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, BorrowedFd};
 use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicBool, Ordering},
@@ -172,6 +172,11 @@ pub struct AtomicDrmSurface {
     prop_mapping: Arc<RwLock<PropMapping>>,
     state: RwLock<State>,
     pending: RwLock<State>,
+    supports_async_page_flip: bool,
+    /// `VRR_ENABLED` as last sent to the kernel, `None` if unknown (see `vrr_commit_pending`)
+    committed_vrr: Mutex<Option<bool>>,
+    /// Whether async commits may carry `IN_FENCE_FD` (see `commit_async_flip`)
+    async_in_fence: Mutex<AsyncInFence>,
     pub(super) span: tracing::Span,
 }
 
@@ -185,6 +190,7 @@ impl AtomicDrmSurface {
         prop_mapping: Arc<RwLock<PropMapping>>,
         mode: Mode,
         connectors: &[connector::Handle],
+        supports_async_page_flip: bool,
     ) -> Result<Self, Error> {
         let span = info_span!("drm_atomic", crtc = ?crtc);
         let _guard = span.enter();
@@ -219,6 +225,9 @@ impl AtomicDrmSurface {
             prop_mapping,
             state: RwLock::new(state),
             pending: RwLock::new(pending),
+            supports_async_page_flip,
+            committed_vrr: Mutex::new(None),
+            async_in_fence: Mutex::new(AsyncInFence::Unknown),
             span,
         };
 
@@ -851,6 +860,7 @@ impl AtomicDrmSurface {
 
         if result.is_ok() {
             *current = pending.clone();
+            *self.committed_vrr.lock().unwrap() = Some(pending.vrr);
             for plane in planes.iter() {
                 if plane.config.is_some() {
                     used_planes.insert(plane.handle);
@@ -879,15 +889,8 @@ impl AtomicDrmSurface {
 
         // page flips work just like commits with fewer parameters..
         let prop_mapping = self.prop_mapping.read().unwrap();
-        let req = AtomicRequest::build_request(
-            &prop_mapping,
-            self.crtc,
-            None,
-            self.state.read().unwrap().vrr,
-            [],
-            [],
-            &*planes,
-        )?;
+        let vrr = self.state.read().unwrap().vrr;
+        let req = AtomicRequest::build_request(&prop_mapping, self.crtc, None, vrr, [], [], &*planes)?;
 
         // .. and without `AtomicCommitFlags::AllowModeset`.
         // If we would set anything here, that would require a modeset, this would fail,
@@ -912,6 +915,7 @@ impl AtomicDrmSurface {
             });
 
         if res.is_ok() {
+            *self.committed_vrr.lock().unwrap() = Some(vrr);
             for plane in planes.iter() {
                 if plane.config.is_some() {
                     used_planes.insert(plane.handle);
@@ -922,6 +926,63 @@ impl AtomicDrmSurface {
         }
 
         res
+    }
+
+    pub fn supports_async_page_flip(&self) -> bool {
+        self.supports_async_page_flip
+    }
+
+    /// Whether `VRR_ENABLED` still has to be sent to the kernel: [`AtomicDrmSurface::use_vrr`]
+    /// switched it without a modeset, or the surface was reset, and no commit or page flip has
+    /// sent it since. An async page flip cannot send it.
+    pub fn vrr_commit_pending(&self) -> bool {
+        // Not holding `committed_vrr` while taking `state`, `commit` takes them the other way round
+        let vrr = self.state.read().unwrap().vrr;
+        *self.committed_vrr.lock().unwrap() != Some(vrr)
+    }
+
+    // An async page flip sets the `FB_ID` of the primary plane (and its `IN_FENCE_FD` where the
+    // kernel takes it), everything else keeps its committed value. See `DrmSurface::page_flip_async`
+    // for the kernel rules behind this.
+    #[instrument(level = "trace", parent = &self.span, skip(self))]
+    #[profiling::function]
+    pub fn page_flip_async(
+        &self,
+        fb: framebuffer::Handle,
+        fence: Option<BorrowedFd<'_>>,
+    ) -> Result<(), Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+        if self.vrr_commit_pending() {
+            // The kernel refuses a changed `VRR_ENABLED` in an async commit, and leaving it out
+            // would drop the change: refuse like the kernel would
+            return Err(Error::Access(AccessError {
+                errmsg: "Async page flip with a pending VRR change",
+                dev: self.fd.dev_path(),
+                source: rustix::io::Errno::INVAL.into(),
+            }));
+        }
+
+        let prop_mapping = self.prop_mapping.read().unwrap();
+        commit_async_flip(&self.async_in_fence, fence, |fence| {
+            let req = AtomicRequest::build_async_flip_request(&prop_mapping, self.plane, fb, fence)?;
+            trace!("Queueing async page flip: {:?}", req);
+            self.fd
+                .atomic_commit(
+                    AtomicCommitFlags::PAGE_FLIP_EVENT
+                        | AtomicCommitFlags::NONBLOCK
+                        | AtomicCommitFlags::PAGE_FLIP_ASYNC,
+                    req.build()?,
+                )
+                .map_err(|source| {
+                    Error::Access(AccessError {
+                        errmsg: "Async page flip commit failed",
+                        dev: self.fd.dev_path(),
+                        source,
+                    })
+                })
+        })
     }
 
     // this helper function disconnects the plane.
@@ -994,6 +1055,7 @@ impl AtomicDrmSurface {
         if res.is_ok() {
             self.used_planes.lock().unwrap().clear();
             self.state.write().unwrap().clear();
+            *self.committed_vrr.lock().unwrap() = Some(false);
         }
 
         res
@@ -1008,6 +1070,8 @@ impl AtomicDrmSurface {
         } else {
             State::current_state(&*self.fd, self.crtc, &mut self.prop_mapping.write().unwrap())?
         };
+        // Someone else may have changed it, the next commit or page flip sends it again
+        *self.committed_vrr.lock().unwrap() = None;
 
         // Re-initialize the mode blob which might got lost after suspend/resume
         let mut pending = self.pending.write().unwrap();
@@ -1031,6 +1095,56 @@ impl AtomicDrmSurface {
 
     pub fn clear(&self) -> Result<(), Error> {
         self.clear_state()
+    }
+}
+
+/// Whether the kernel takes `IN_FENCE_FD` in an async commit: Linux 6.11 and newer do on the
+/// primary plane. 6.8 to 6.10 refuse with `EINVAL` any plane property but `FB_ID` that differs
+/// from its current value, and `IN_FENCE_FD` always reads as -1, so they refuse every fence
+/// (`drm_atomic_set_property` in `drivers/gpu/drm/drm_atomic_uapi.c`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsyncInFence {
+    /// No async commit with a fence was made yet
+    Unknown,
+    /// An async commit with a fence succeeded
+    Accepted,
+    /// An async commit with a fence was refused, and the same commit without it succeeded
+    Refused,
+}
+
+/// Makes an async commit with `fence`, unless the kernel is known to refuse it.
+///
+/// `commit` makes the async commit with or without the fence. While it is unknown whether the
+/// kernel takes the fence, a refusal (`EINVAL`) of the commit with the fence is tried again
+/// without it: if that succeeds, the fence was the reason, and later async commits leave it out
+/// (the kernel then falls back to the implicit fences of the buffer). If it fails as well, the
+/// commit was refused for another reason and its error is returned.
+fn commit_async_flip<T: Copy>(
+    in_fence: &Mutex<AsyncInFence>,
+    fence: Option<T>,
+    mut commit: impl FnMut(Option<T>) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let mut in_fence = in_fence.lock().unwrap();
+    let Some(fence) = fence.filter(|_| *in_fence != AsyncInFence::Refused) else {
+        return commit(None);
+    };
+    match commit(Some(fence)) {
+        Ok(()) => {
+            *in_fence = AsyncInFence::Accepted;
+            Ok(())
+        }
+        Err(err) if *in_fence == AsyncInFence::Unknown && err.is_invalid_argument() => {
+            debug!(
+                ?err,
+                "async page flip with IN_FENCE_FD refused (Linux before 6.11?), trying without"
+            );
+            let res = commit(None);
+            if res.is_ok() {
+                *in_fence = AsyncInFence::Refused;
+            }
+            res
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -1267,6 +1381,29 @@ impl<'a> AtomicRequest<'a> {
             self.reset_plane(handle)?;
         }
 
+        Ok(())
+    }
+
+    fn set_plane_fb(
+        &mut self,
+        plane: plane::Handle,
+        fb: framebuffer::Handle,
+        fence: Option<BorrowedFd<'_>>,
+    ) -> Result<(), Error> {
+        let plane_props = self.plane_props.entry(plane).or_default();
+        plane_props.insert("FB_ID", property::Value::Framebuffer(Some(fb)));
+        if let Some(fence) = fence {
+            if self.mapping.plane_prop_handle(plane, "IN_FENCE_FD").is_err() {
+                return Err(Error::UnknownProperty {
+                    handle: plane.into(),
+                    name: "IN_FENCE_FD",
+                });
+            }
+            plane_props.insert(
+                "IN_FENCE_FD",
+                property::Value::SignedRange(fence.as_raw_fd() as i64),
+            );
+        }
         Ok(())
     }
 
@@ -1521,6 +1658,27 @@ impl<'a> AtomicRequest<'a> {
         Ok(())
     }
 
+    fn set_plane_fb(
+        &mut self,
+        plane: plane::Handle,
+        fb: framebuffer::Handle,
+        fence: Option<BorrowedFd<'_>>,
+    ) -> Result<(), Error> {
+        self.request.add_property(
+            plane,
+            self.mapping.plane_prop_handle(plane, "FB_ID")?,
+            property::Value::Framebuffer(Some(fb)),
+        );
+        if let Some(fence) = fence {
+            self.request.add_property(
+                plane,
+                self.mapping.plane_prop_handle(plane, "IN_FENCE_FD")?,
+                property::Value::SignedRange(fence.as_raw_fd() as i64),
+            );
+        }
+        Ok(())
+    }
+
     fn reset_plane(&mut self, plane: plane::Handle) -> Result<(), Error> {
         self.request.add_property(
             plane,
@@ -1643,6 +1801,24 @@ impl<'a> AtomicRequest<'a> {
 
         Ok(req)
     }
+
+    /// The request of an async page flip: the `FB_ID` of the primary `plane`, its `IN_FENCE_FD` if
+    /// a `fence` is given, and nothing else.
+    ///
+    /// Everything left out keeps its committed value, which is what every kernel accepts in an
+    /// async commit. In particular there is no CRTC property (`ACTIVE`, `MODE_ID`, `VRR_ENABLED`),
+    /// no connector, no other plane and no `FB_DAMAGE_CLIPS` (so the whole plane counts as damaged).
+    /// `IN_FENCE_FD` is only taken by Linux 6.11 and newer, see `commit_async_flip`.
+    fn build_async_flip_request(
+        mapping: &'a PropMapping,
+        plane: plane::Handle,
+        fb: framebuffer::Handle,
+        fence: Option<BorrowedFd<'_>>,
+    ) -> Result<AtomicRequest<'a>, Error> {
+        let mut req = AtomicRequest::new(mapping);
+        req.set_plane_fb(plane, fb, fence)?;
+        Ok(req)
+    }
 }
 
 #[cfg(test)]
@@ -1673,5 +1849,265 @@ mod test {
         let geometry: Rectangle<f64, Physical> = Rectangle::from_size((1920.1, 1080.0).into());
         let fixed = to_fixed(geometry.size.w) as u64;
         assert_eq!(125835674, fixed);
+    }
+
+    mod async_flip {
+        use std::collections::HashMap;
+        use std::os::unix::io::AsFd;
+        use std::sync::Mutex;
+
+        use drm::control::{RawResourceHandle, connector, crtc, framebuffer, from_u32, plane};
+
+        use super::super::{AsyncInFence, AtomicRequest, commit_async_flip};
+        use crate::backend::drm::{
+            device::atomic::PropMapping,
+            error::{AccessError, Error},
+        };
+        // The debug build of `AtomicRequest` keeps the properties by name, so the tests can read them
+        #[cfg(debug_assertions)]
+        use {
+            super::super::{PlaneConfig, PlaneState},
+            crate::utils::{Rectangle, Transform},
+            drm::control::property,
+            std::os::unix::io::AsRawFd,
+        };
+
+        fn handle<T: From<RawResourceHandle>>(raw: u32) -> T {
+            from_u32(raw).unwrap()
+        }
+
+        /// The properties an atomic driver typically exposes for one connector, crtc and plane
+        fn mapping(conn: connector::Handle, crtc: crtc::Handle, plane: plane::Handle) -> PropMapping {
+            let props = |names: &[&str], first: u32| {
+                (names.iter().zip(first..))
+                    .map(|(name, raw)| (name.to_string(), handle(raw)))
+                    .collect::<HashMap<_, _>>()
+            };
+            PropMapping {
+                connectors: HashMap::from([(conn, props(&["CRTC_ID"], 100))]),
+                crtcs: HashMap::from([(crtc, props(&["ACTIVE", "MODE_ID", "VRR_ENABLED"], 200))]),
+                planes: HashMap::from([(
+                    plane,
+                    props(
+                        &[
+                            "CRTC_ID",
+                            "FB_ID",
+                            "SRC_X",
+                            "SRC_Y",
+                            "SRC_W",
+                            "SRC_H",
+                            "CRTC_X",
+                            "CRTC_Y",
+                            "CRTC_W",
+                            "CRTC_H",
+                            "rotation",
+                            "alpha",
+                            "FB_DAMAGE_CLIPS",
+                            "IN_FENCE_FD",
+                        ],
+                        300,
+                    ),
+                )]),
+            }
+        }
+
+        #[test]
+        fn async_request_only_sets_the_primary_fb() {
+            let (conn, crtc, plane) = (handle(1), handle(2), handle(3));
+            let fb: framebuffer::Handle = handle(4);
+            let mapping = mapping(conn, crtc, plane);
+
+            let req = AtomicRequest::build_async_flip_request(&mapping, plane, fb, None).unwrap();
+            req.build().unwrap();
+
+            #[cfg(debug_assertions)]
+            {
+                assert!(req.crtc_props.is_empty(), "{req:?}");
+                assert!(req.connector_props.is_empty(), "{req:?}");
+                assert_eq!(
+                    req.plane_props,
+                    HashMap::from([(
+                        plane,
+                        HashMap::from([("FB_ID", property::Value::Framebuffer(Some(fb)))])
+                    )])
+                );
+            }
+        }
+
+        #[test]
+        fn async_request_with_a_fence_also_sets_the_primary_in_fence() {
+            let (conn, crtc, plane) = (handle(1), handle(2), handle(3));
+            let fb: framebuffer::Handle = handle(4);
+            let mapping = mapping(conn, crtc, plane);
+            let (fence, _other_end) = rustix::pipe::pipe().unwrap();
+
+            let req =
+                AtomicRequest::build_async_flip_request(&mapping, plane, fb, Some(fence.as_fd())).unwrap();
+            req.build().unwrap();
+
+            #[cfg(debug_assertions)]
+            {
+                assert!(req.crtc_props.is_empty(), "{req:?}");
+                assert!(req.connector_props.is_empty(), "{req:?}");
+                assert_eq!(
+                    req.plane_props,
+                    HashMap::from([(
+                        plane,
+                        HashMap::from([
+                            ("FB_ID", property::Value::Framebuffer(Some(fb))),
+                            (
+                                "IN_FENCE_FD",
+                                property::Value::SignedRange(fence.as_raw_fd() as i64)
+                            ),
+                        ])
+                    )])
+                );
+            }
+
+            // Like a vsynced flip, a fence on a plane without `IN_FENCE_FD` is an error
+            let mut no_fence_prop = mapping.clone();
+            no_fence_prop
+                .planes
+                .get_mut(&plane)
+                .unwrap()
+                .remove("IN_FENCE_FD");
+            assert!(matches!(
+                AtomicRequest::build_async_flip_request(&no_fence_prop, plane, fb, Some(fence.as_fd())),
+                Err(Error::UnknownProperty {
+                    name: "IN_FENCE_FD",
+                    ..
+                })
+            ));
+        }
+
+        fn errno(errno: rustix::io::Errno) -> Error {
+            Error::Access(AccessError {
+                errmsg: "Async page flip commit failed",
+                dev: None,
+                source: errno.into(),
+            })
+        }
+
+        /// Runs `commit_async_flip` with a fence, the kernel answering each commit with
+        /// `kernel(with_fence)`, and returns the result and the commits made (with a fence or not)
+        fn async_flip_with_fence(
+            in_fence: &Mutex<AsyncInFence>,
+            kernel: impl Fn(bool) -> Result<(), Error>,
+        ) -> (Result<(), Error>, Vec<bool>) {
+            let mut commits = Vec::new();
+            let res = commit_async_flip(in_fence, Some(7), |fence| {
+                assert!(fence.is_none_or(|fence| fence == 7));
+                commits.push(fence.is_some());
+                kernel(fence.is_some())
+            });
+            (res, commits)
+        }
+
+        #[test]
+        fn a_kernel_that_takes_the_fence_gets_it() {
+            let in_fence = Mutex::new(AsyncInFence::Unknown);
+            for _ in 0..2 {
+                let (res, commits) = async_flip_with_fence(&in_fence, |_| Ok(()));
+                assert!(res.is_ok());
+                assert_eq!(commits, [true]);
+                assert_eq!(*in_fence.lock().unwrap(), AsyncInFence::Accepted);
+            }
+            // A later refusal has another reason, it is not retried without the fence
+            let (res, commits) = async_flip_with_fence(&in_fence, |_| Err(errno(rustix::io::Errno::INVAL)));
+            assert!(res.unwrap_err().is_invalid_argument());
+            assert_eq!(commits, [true]);
+            assert_eq!(*in_fence.lock().unwrap(), AsyncInFence::Accepted);
+        }
+
+        #[test]
+        fn a_kernel_that_refuses_the_fence_gets_the_flip_without_it() {
+            // Linux 6.8 to 6.10
+            let kernel = |with_fence: bool| {
+                if with_fence {
+                    Err(errno(rustix::io::Errno::INVAL))
+                } else {
+                    Ok(())
+                }
+            };
+            let in_fence = Mutex::new(AsyncInFence::Unknown);
+            let (res, commits) = async_flip_with_fence(&in_fence, kernel);
+            assert!(res.is_ok());
+            assert_eq!(commits, [true, false]);
+            assert_eq!(*in_fence.lock().unwrap(), AsyncInFence::Refused);
+            // From now on the fence is left out right away
+            let (res, commits) = async_flip_with_fence(&in_fence, kernel);
+            assert!(res.is_ok());
+            assert_eq!(commits, [false]);
+        }
+
+        #[test]
+        fn a_refusal_for_another_reason_teaches_nothing() {
+            let in_fence = Mutex::new(AsyncInFence::Unknown);
+            let (res, commits) = async_flip_with_fence(&in_fence, |_| Err(errno(rustix::io::Errno::INVAL)));
+            assert!(res.unwrap_err().is_invalid_argument());
+            assert_eq!(commits, [true, false]);
+            assert_eq!(*in_fence.lock().unwrap(), AsyncInFence::Unknown);
+            // Other errors are not retried
+            let (res, commits) = async_flip_with_fence(&in_fence, |_| Err(errno(rustix::io::Errno::BUSY)));
+            assert!(!res.unwrap_err().is_invalid_argument());
+            assert_eq!(commits, [true]);
+            assert_eq!(*in_fence.lock().unwrap(), AsyncInFence::Unknown);
+        }
+
+        #[test]
+        fn a_flip_without_a_fence_is_committed_as_it_is() {
+            for state in [
+                AsyncInFence::Unknown,
+                AsyncInFence::Accepted,
+                AsyncInFence::Refused,
+            ] {
+                let in_fence = Mutex::new(state);
+                let mut commits = Vec::new();
+                let res = commit_async_flip(&in_fence, None::<i32>, |fence| {
+                    commits.push(fence.is_some());
+                    Err(errno(rustix::io::Errno::INVAL))
+                });
+                assert!(res.unwrap_err().is_invalid_argument());
+                assert_eq!(commits, [false]);
+                assert_eq!(*in_fence.lock().unwrap(), state);
+            }
+        }
+
+        // The request of a vsynced flip of the same plane sets what async commits must leave alone
+        #[cfg(debug_assertions)]
+        #[test]
+        fn vsync_request_sets_what_async_commits_leave_out() {
+            let (conn, crtc, plane) = (handle(1), handle(2), handle(3));
+            let mapping = mapping(conn, crtc, plane);
+            let state = PlaneState {
+                handle: plane,
+                config: Some(PlaneConfig {
+                    src: Rectangle::from_size((2560.0, 1440.0).into()),
+                    dst: Rectangle::from_size((2560, 1440).into()),
+                    transform: Transform::Normal,
+                    alpha: 1.0,
+                    damage_clips: Some(property::Value::Blob(5)),
+                    fb: handle(4),
+                    fence: None,
+                }),
+            };
+
+            let req = AtomicRequest::build_request(&mapping, crtc, None, true, [], [], [&state]).unwrap();
+
+            assert_eq!(
+                req.crtc_props[&crtc].get("VRR_ENABLED"),
+                Some(&property::Value::Boolean(true))
+            );
+            let plane_props = &req.plane_props[&plane];
+            assert_eq!(
+                plane_props.get("FB_DAMAGE_CLIPS"),
+                Some(&property::Value::Blob(5))
+            );
+            assert_eq!(
+                plane_props.get("IN_FENCE_FD"),
+                Some(&property::Value::SignedRange(-1))
+            );
+            assert_eq!(plane_props.len(), 14);
+        }
     }
 }

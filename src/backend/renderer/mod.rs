@@ -66,6 +66,16 @@ use sync::SyncPoint;
 #[cfg(any(feature = "renderer_test", test, doctest))]
 pub mod test;
 
+/// How a frame is presented on a display
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PresentationMode {
+    /// At the next vertical blank
+    #[default]
+    VSync,
+    /// As soon as possible, without waiting for the vertical blank (tearing)
+    Async,
+}
+
 /// Identifies a renderer context for a specific texture type.
 ///
 /// Renderers with the same `ContextId` are assumed to be texture-compatible,

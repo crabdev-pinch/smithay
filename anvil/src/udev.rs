@@ -45,7 +45,7 @@ use smithay::{
         input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            DebugFlags, ImportDma, ImportMemWl,
+            DebugFlags, ImportDma, ImportMemWl, PresentationMode,
             damage::Error as OutputDamageTrackerError,
             element::{AsRenderElements, RenderElementStates, memory::MemoryRenderBuffer},
             gles::{Capability, GlesRenderer},
@@ -641,6 +641,7 @@ struct SurfaceData {
         DrmDeviceFd,
     >,
     disable_direct_scanout: bool,
+    force_tearing: bool,
     #[cfg(feature = "debug")]
     fps: fps_ticker::Fps,
     #[cfg(feature = "debug")]
@@ -1041,6 +1042,7 @@ impl AnvilState<UdevData> {
             };
 
             let disable_direct_scanout = std::env::var("ANVIL_DISABLE_DIRECT_SCANOUT").is_ok();
+            let force_tearing = std::env::var("ANVIL_FORCE_TEARING").is_ok();
 
             let dmabuf_feedback = drm_output.with_compositor(|compositor| {
                 compositor.set_debug_flags(self.backend_data.debug_flags);
@@ -1062,6 +1064,7 @@ impl AnvilState<UdevData> {
                 global: Some(global),
                 drm_output,
                 disable_direct_scanout,
+                force_tearing,
                 #[cfg(feature = "debug")]
                 fps: fps_ticker::Fps::default(),
                 #[cfg(feature = "debug")]
@@ -1245,7 +1248,15 @@ impl AnvilState<UdevData> {
 
         let seq = metadata.as_ref().map(|metadata| metadata.sequence).unwrap_or(0);
 
-        let (clock, flags) = if let Some(tp) = tp {
+        // An async page flip happens between two vblanks, but its event carries the time of the
+        // last one: use the time it arrived instead, and leave it out of the vblank throttling
+        let presented_async = surface.drm_output.with_pending_frame(|frame| {
+            frame.is_some_and(|frame| frame.presentation_mode == PresentationMode::Async)
+        });
+
+        let (clock, flags) = if presented_async {
+            (self.clock.now(), wp_presentation_feedback::Kind::HwCompletion)
+        } else if let Some(tp) = tp {
             (
                 tp.into(),
                 wp_presentation_feedback::Kind::Vsync
@@ -1261,6 +1272,7 @@ impl AnvilState<UdevData> {
         });
 
         if let Some(vblank_remaining_time) = vblank_remaining_time
+            && !presented_async
             && vblank_remaining_time > frame_duration / 2
         {
             static WARN_ONCE: Once = Once::new();
@@ -1284,7 +1296,9 @@ impl AnvilState<UdevData> {
             surface.vblank_throttle_timer = Some(timer_token);
             return;
         }
-        surface.last_presentation_time = Some(clock);
+        if !presented_async {
+            surface.last_presentation_time = Some(clock);
+        }
 
         let submit_result = surface
             .drm_output
@@ -1648,6 +1662,8 @@ fn render_surface<'a>(
 
     let frame_mode = if surface.disable_direct_scanout {
         FrameFlags::empty()
+    } else if surface.force_tearing {
+        FrameFlags::DEFAULT | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY | FrameFlags::ALLOW_ASYNC_PAGE_FLIP
     } else {
         FrameFlags::DEFAULT
     };

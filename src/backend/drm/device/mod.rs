@@ -109,6 +109,7 @@ pub struct DrmDevice {
     pub(super) dev_id: dev_t,
     pub(crate) internal: Arc<DrmDeviceInternal>,
     has_universal_planes: bool,
+    has_async_page_flip: bool,
     cursor_size: Size<u32, Buffer>,
     resources: ResourceHandles,
     plane_claim_storage: PlaneClaimStorage,
@@ -214,12 +215,20 @@ impl DrmDevice {
         })?;
 
         let internal = Arc::new(DrmDevice::create_internal(fd, active, disable_connectors)?);
+        // Only the atomic path implements async page flips, the legacy one ignores the request
+        let has_async_page_flip = matches!(&*internal, DrmDeviceInternal::Atomic(_))
+            && internal
+                .device_fd()
+                .get_driver_capability(DriverCapability::AtomicASyncPageFlip)
+                .unwrap_or(0)
+                == 1;
 
         Ok((
             DrmDevice {
                 dev_id,
                 internal: internal.clone(),
                 has_universal_planes,
+                has_async_page_flip,
                 cursor_size,
                 resources,
                 plane_claim_storage: Default::default(),
@@ -264,6 +273,15 @@ impl DrmDevice {
             DrmDeviceInternal::Atomic(_) => true,
             DrmDeviceInternal::Legacy(_) => false,
         }
+    }
+
+    /// Returns if this device can flip the planes of its surfaces without waiting
+    /// for the vertical blank, see [`FrameFlags::ALLOW_ASYNC_PAGE_FLIP`](crate::backend::drm::compositor::FrameFlags::ALLOW_ASYNC_PAGE_FLIP).
+    ///
+    /// This is `DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP` (Linux 6.8 and newer, queried when the device is opened)
+    /// and always `false` when the device uses the legacy api, which does not implement async page flips.
+    pub fn supports_async_page_flip(&self) -> bool {
+        self.has_async_page_flip
     }
 
     /// Returns a list of crtcs for this device
@@ -373,6 +391,7 @@ impl DrmDevice {
                 mapping,
                 mode,
                 connectors,
+                self.has_async_page_flip,
             )?)
         } else {
             DrmSurfaceInternal::Legacy(LegacyDrmSurface::new(

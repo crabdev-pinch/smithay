@@ -449,6 +449,95 @@ impl DrmSurface {
         }
     }
 
+    /// Returns if [`DrmSurface::page_flip_async`] can flip without waiting for the vertical blank,
+    /// see [`DrmDevice::supports_async_page_flip`](crate::backend::drm::DrmDevice::supports_async_page_flip).
+    pub fn supports_async_page_flip(&self) -> bool {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.supports_async_page_flip(),
+            DrmSurfaceInternal::Legacy(_) => false,
+        }
+    }
+
+    /// Whether `VRR_ENABLED` still has to be sent to the kernel by a vsynced commit or page flip:
+    /// [`DrmSurface::use_vrr`] switched VRR without a modeset (which only stages the value for the
+    /// next flip), or the surface was reset, and nothing has sent it since.
+    /// [`DrmSurface::page_flip_async`] cannot send it. Always `false` on the legacy api.
+    pub(crate) fn vrr_commit_pending(&self) -> bool {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.vrr_commit_pending(),
+            DrmSurfaceInternal::Legacy(_) => false,
+        }
+    }
+
+    /// Page-flip the primary plane to `fb` without waiting for the vertical blank
+    /// (an atomic commit with `DRM_MODE_PAGE_FLIP_ASYNC | DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK`).
+    ///
+    /// The commit sets the primary plane's `FB_ID`, and its `IN_FENCE_FD` if a `fence` is given,
+    /// and nothing else: every other property of the primary plane, every other plane, the crtc
+    /// (including `VRR_ENABLED`) and the connectors keep the values of the last commit, and no
+    /// damage (`FB_DAMAGE_CLIPS`) is attached, so the whole plane counts as damaged. So `fb` has to
+    /// be ready for scan-out and fit the primary plane as it was last committed (source and
+    /// destination rectangle, rotation, alpha, format and modifier), and a pending mode or
+    /// connector change ([`DrmSurface::commit_pending`]) is not applied by this flip. If
+    /// [`DrmSurface::use_vrr`] switched VRR without a modeset and no commit or page flip has sent
+    /// the new value yet, nothing is committed and `EINVAL` is returned, because an async commit
+    /// cannot change `VRR_ENABLED`: flip that frame with [`DrmSurface::page_flip`] instead.
+    ///
+    /// `fence` is what the vsynced flip of the same buffer would set as `IN_FENCE_FD`. Linux 6.11
+    /// and newer take it in an async commit. 6.8 to 6.10 refuse it: the first async flip with a
+    /// fence finds this out by trying the same commit again at once without the fence, and later
+    /// async flips of this surface leave it out, so the kernel waits for the implicit fences of
+    /// the buffer instead.
+    ///
+    /// Why only these properties: the kernel (`drm_atomic_set_property` in `drivers/gpu/drm/drm_atomic_uapi.c`)
+    /// accepts an async commit only if every connector and crtc property is set to its current
+    /// value (no modeset, no VRR change). For planes the rules changed between versions:
+    /// - Linux 6.8 to 6.10: only the primary plane may change, and only `FB_ID`; an `FB_ID` on any
+    ///   other plane is refused even if it is unchanged, and `IN_FENCE_FD` / `FB_DAMAGE_CLIPS` may
+    ///   only be -1 / 0.
+    /// - 6.11 to 6.14: the primary plane may also set `IN_FENCE_FD` and `FB_DAMAGE_CLIPS`, other
+    ///   planes only their current values.
+    /// - 6.15 to 6.17: any property of a non-primary plane, changed or not, needs the driver's
+    ///   `atomic_async_check`; amdgpu accepts overlay planes only, so even an unchanged cursor plane
+    ///   in the request makes it fail.
+    /// - 6.18 and newer: unchanged values are accepted on every plane.
+    ///
+    /// Drivers add their own rules. amdgpu (`amdgpu_dm_atomic_check`) refuses with `EINVAL` an async
+    /// flip that is not a "fast update": one that changes a plane's source or destination size,
+    /// rotation, alpha, blending, color encoding, range or management, pixel format, tiling or
+    /// modifier (DCC), or turns a plane on or off. Its check does not look at the pitch or size of
+    /// the buffer or at the position of the plane, so a change of only these is accepted. A
+    /// framebuffer in another memory domain (VRAM vs. GTT) than the one on screen is accepted up to
+    /// Linux 7.1 (the check compares the new plane state with itself), but flipped at the vertical
+    /// blank; 7.2 refuses it with `EINVAL`. i915 (Skylake and newer) flips the first async commit
+    /// after a vsynced one at the vertical blank. So success means that the flip was committed as
+    /// an async flip, not that the driver did not wait for the vertical blank.
+    /// While a previous non-blocking commit on the crtc has not completed, the kernel returns
+    /// `EBUSY`, as it does for vsynced page flips. Before Linux 6.8, or without
+    /// `DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP`, it returns `EINVAL`.
+    ///
+    /// The page-flip event arrives like the one of any other flip. The kernel sends it once the flip
+    /// is done, but stamps it with the time and sequence of the most recent vertical blank
+    /// (`drm_crtc_send_vblank_event`), which is earlier than the flip: the time the event is received
+    /// is the better estimate of when the new framebuffer was presented. (With VRR active, amdgpu
+    /// holds the event of a flip that completes in the vertical front porch back until the front
+    /// porch ends.)
+    ///
+    /// The legacy api ignores the request: there this is a regular page flip of the primary plane at
+    /// the next vertical blank ([`DrmSurface::supports_async_page_flip`] is `false`), and `fence` is
+    /// not used.
+    #[profiling::function]
+    pub fn page_flip_async(
+        &self,
+        fb: framebuffer::Handle,
+        fence: Option<BorrowedFd<'_>>,
+    ) -> Result<(), Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.page_flip_async(fb, fence),
+            DrmSurfaceInternal::Legacy(surf) => surf.page_flip(fb, true),
+        }
+    }
+
     /// Returns a set of available planes for this surface
     pub fn planes(&self) -> &Planes {
         &self.planes
