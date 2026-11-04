@@ -88,6 +88,14 @@ pub enum Error {
     TestFailed(crtc::Handle),
 }
 
+impl Error {
+    /// The kernel refused the request with `EINVAL`
+    pub(crate) fn is_invalid_argument(&self) -> bool {
+        matches!(self, Error::Access(access)
+            if rustix::io::Errno::from_io_error(&access.source) == Some(rustix::io::Errno::INVAL))
+    }
+}
+
 impl From<Error> for SwapBuffersError {
     #[inline]
     fn from(err: Error) -> SwapBuffersError {

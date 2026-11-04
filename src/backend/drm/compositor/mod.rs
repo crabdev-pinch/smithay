@@ -159,7 +159,8 @@ use crate::{
         },
         drm::{DrmError, PlaneDamageClips, plane_has_property},
         renderer::{
-            Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture, buffer_y_inverted,
+            Bind, Color32F, DebugFlags, PresentationMode, Renderer, RendererSuper, Texture,
+            buffer_y_inverted,
             damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
             element::{
                 Element, Id, Kind, RenderElement, RenderElementPresentationState, RenderElementState,
@@ -551,6 +552,16 @@ impl<B: Buffer, F: Framebuffer> PlaneState<B, F> {
             _ => false,
         }
     }
+
+    fn async_flip_plane(&self) -> AsyncFlipPlane {
+        let config = self.config.as_ref();
+        AsyncFlipPlane {
+            config: config.map(|config| (*config.buffer.as_ref(), config.properties)),
+            skip: self.skip,
+            client_buffer: config
+                .is_some_and(|config| matches!(config.buffer.buffer, ScanoutBuffer::Wayland(_))),
+        }
+    }
 }
 
 impl<B: Buffer, F: Framebuffer> Clone for PlaneState<B, F> {
@@ -758,6 +769,41 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         )
     }
 
+    /// The planes of this frame as [`async_flip_blocker`] takes them, `current` is the frame on screen
+    fn async_flip_planes<'a>(
+        &'a self,
+        current: &'a Self,
+    ) -> impl Iterator<Item = (plane::Handle, Option<AsyncFlipPlane>, AsyncFlipPlane)> + 'a {
+        self.planes.iter().map(|(handle, next)| {
+            (
+                *handle,
+                current.plane_state(*handle).map(PlaneState::async_flip_plane),
+                next.async_flip_plane(),
+            )
+        })
+    }
+
+    /// Flips the primary plane to its framebuffer of this frame without waiting for the vblank,
+    /// leaving everything else as it is (see [`DrmSurface::page_flip_async`])
+    #[profiling::function]
+    fn page_flip_async(
+        &self,
+        surface: &DrmSurface,
+        primary: plane::Handle,
+    ) -> Result<(), crate::backend::drm::error::Error> {
+        debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
+        let config = self
+            .plane_state(primary)
+            .and_then(|state| state.config.as_ref())
+            .ok_or(crate::backend::drm::error::Error::NoFramebuffer(primary))?;
+        // The fence a vsynced flip of this frame would set as `IN_FENCE_FD` (see `build_planes`)
+        let fence = config
+            .sync
+            .as_ref()
+            .and_then(|(_, fence)| fence.as_ref().map(|fence| fence.as_fd()));
+        surface.page_flip_async(*config.buffer.as_ref(), fence)
+    }
+
     #[profiling::function]
     fn build_planes<'a>(
         &'a mut self,
@@ -944,6 +990,8 @@ impl From<&PlaneInfo> for PlaneAssignment {
 struct PendingFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>, U> {
     frame: CompositorFrameState<A, F>,
     user_data: U,
+    presentation_mode: PresentationMode,
+    async_refused: bool,
 }
 
 impl<A, F, U> std::fmt::Debug for PendingFrame<A, F, U>
@@ -958,6 +1006,8 @@ where
         f.debug_struct("PendingFrame")
             .field("frame", &self.frame)
             .field("user_data", &self.user_data)
+            .field("presentation_mode", &self.presentation_mode)
+            .field("async_refused", &self.async_refused)
             .finish()
     }
 }
@@ -992,6 +1042,8 @@ enum PreparedFrameKind {
 struct PreparedFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>> {
     frame: CompositorFrameState<A, F>,
     kind: PreparedFrameKind,
+    /// Rendered with [`FrameFlags::ALLOW_ASYNC_PAGE_FLIP`]
+    async_page_flip: bool,
 }
 
 impl<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>> PreparedFrame<A, F> {
@@ -1014,6 +1066,7 @@ where
         f.debug_struct("PreparedFrame")
             .field("frame", &self.frame)
             .field("kind", &self.kind)
+            .field("async_page_flip", &self.async_page_flip)
             .finish()
     }
 }
@@ -1034,10 +1087,193 @@ bitflags::bitflags! {
         const ALLOW_CURSOR_PLANE_SCANOUT = 8;
         /// Return `EmptyFrame`, if only the cursor plane would have been updated
         const SKIP_CURSOR_ONLY_UPDATES = 16;
+        /// Present the frame with an async page flip (`DRM_MODE_PAGE_FLIP_ASYNC`, tearing) if it qualifies
+        ///
+        /// No overlay plane is used in a frame rendered with this flag. When the frame is submitted,
+        /// it flips without waiting for the vertical blank if all of these hold, and at the next
+        /// vertical blank like any other frame otherwise:
+        /// - the device supports it ([`DrmDevice::supports_async_page_flip`](crate::backend::drm::DrmDevice::supports_async_page_flip));
+        /// - no state change is pending ([`DrmSurface::commit_pending`]), the frame is not the
+        ///   first one after a reset, and no VRR switch made with [`DrmSurface::use_vrr`] still has to
+        ///   be committed (an async commit cannot change `VRR_ENABLED`, so this frame sends it);
+        /// - the primary plane scans out a client buffer directly (no composition);
+        /// - its source and destination rectangle, transform, alpha and format (with the modifier)
+        ///   are those of the primary plane on screen;
+        /// - no other plane changes: the cursor plane may be in use, but neither moves nor changes.
+        ///
+        /// Like vsynced direct scan-out, this relies on the acquire point of an explicitly
+        /// synchronized client buffer having signaled before the frame is rendered (as with
+        /// `DrmSyncobjBlocker`): the async commit carries the same pre-signaled `IN_FENCE_FD` as a
+        /// vsynced one, where the kernel takes it (see [`DrmSurface::page_flip_async`]).
+        ///
+        /// The async commit sets only the primary plane's framebuffer (and fence), see
+        /// [`DrmSurface::page_flip_async`] for the kernel rules. If the kernel refuses it with
+        /// `EINVAL`, the same frame is committed again at once to flip at the next vertical blank,
+        /// so no frame is lost. Any other error, like `EBUSY` while a previous commit is still in
+        /// flight, is returned like the error of any other page flip.
+        /// [`DrmCompositor::pending_frame`] tells how a submitted frame went out.
+        ///
+        /// The flag applies to the frame rendered with it only. Without it nothing changes, and
+        /// the legacy api ignores it.
+        const ALLOW_ASYNC_PAGE_FLIP = 32;
         /// Allow to realize the frame by assigning elements on any plane
         const ALLOW_SCANOUT = Self::ALLOW_PRIMARY_PLANE_SCANOUT.bits() | Self::ALLOW_OVERLAY_PLANE_SCANOUT.bits() | Self::ALLOW_CURSOR_PLANE_SCANOUT.bits();
         /// Safe default set of flags
         const DEFAULT = Self::ALLOW_SCANOUT.bits();
+    }
+}
+
+/// A frame that was committed and waits for its page flip, see [`DrmCompositor::pending_frame`]
+#[derive(Debug)]
+pub struct FrameRef<'a, U> {
+    /// User data of the frame, as given to [`DrmCompositor::queue_frame`]
+    pub user_data: &'a U,
+    /// How the frame was committed: [`PresentationMode::Async`] if with an async page flip
+    /// ([`FrameFlags::ALLOW_ASYNC_PAGE_FLIP`]), [`PresentationMode::VSync`] otherwise.
+    ///
+    /// A driver may still carry out an async commit at the vertical blank: amdgpu does for a
+    /// buffer in another memory domain than the one on screen (up to Linux 7.1), and i915
+    /// (Skylake and newer) for the first async flip after a vsynced one.
+    pub presentation_mode: PresentationMode,
+    /// The frame qualified for an async page flip, but the kernel refused the async commit with
+    /// `EINVAL`, so the same frame was committed again to flip at the next vertical blank
+    pub async_refused: bool,
+}
+
+/// Why a frame with [`FrameFlags::ALLOW_ASYNC_PAGE_FLIP`] flips at the next vertical blank
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsyncFlipBlocker {
+    /// The device does not support async page flips, or uses the legacy api
+    Unsupported,
+    /// The frame is the first one after a reset or comes with a state change
+    FullCommit,
+    /// A VRR switch (or a reset of the surface) still has to be committed, which an async commit
+    /// cannot do
+    VrrChange,
+    /// The primary plane is composited or off
+    NoDirectScanout,
+    /// The primary plane changes more than its framebuffer
+    PrimaryChanged,
+    /// Another plane changes
+    OtherPlaneChanged,
+}
+
+/// The surface a frame is submitted to, as far as async page flips are concerned
+#[derive(Debug, Clone, Copy)]
+struct AsyncFlipSurface {
+    /// The device does async page flips (never on the legacy api)
+    supported: bool,
+    /// The frame is the first one after a reset or comes with a state change
+    full_commit: bool,
+    /// `VRR_ENABLED` still has to be committed, see `DrmSurface::vrr_commit_pending`
+    vrr_commit_pending: bool,
+}
+
+/// One plane of a frame, as far as async page flips are concerned
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AsyncFlipPlane {
+    /// Framebuffer and properties, `None` if the plane is off
+    config: Option<(framebuffer::Handle, PlaneProperties)>,
+    /// A partial update leaves the plane out
+    skip: bool,
+    /// The plane scans out a client buffer
+    client_buffer: bool,
+}
+
+/// Checks whether a frame can be committed as an async page flip on top of the frame on screen:
+/// the surface allows it, the `primary` plane changes nothing but the framebuffer, and no other
+/// plane changes at all. Each plane is given as `(handle, on screen, next)`.
+fn async_flip_blocker(
+    surface: AsyncFlipSurface,
+    primary: plane::Handle,
+    planes: impl IntoIterator<Item = (plane::Handle, Option<AsyncFlipPlane>, AsyncFlipPlane)>,
+) -> Option<AsyncFlipBlocker> {
+    if !surface.supported {
+        return Some(AsyncFlipBlocker::Unsupported);
+    }
+    if surface.full_commit {
+        return Some(AsyncFlipBlocker::FullCommit);
+    }
+    if surface.vrr_commit_pending {
+        return Some(AsyncFlipBlocker::VrrChange);
+    }
+
+    // Comparing the configs, not only `skip`: `SKIP_CURSOR_ONLY_UPDATES` skips a moved cursor
+    let unchanged = |current: Option<AsyncFlipPlane>, next: AsyncFlipPlane| {
+        next.skip && current.and_then(|current| current.config) == next.config
+    };
+    let mut primary_plane = None;
+    let mut other_plane_changed = false;
+    for (handle, current, next) in planes {
+        if handle == primary {
+            primary_plane = Some((current, next));
+        } else if !unchanged(current, next) {
+            other_plane_changed = true;
+        }
+    }
+
+    let Some((current, next)) = primary_plane else {
+        return Some(AsyncFlipBlocker::NoDirectScanout);
+    };
+    let Some((_, properties)) = next.config.filter(|_| next.client_buffer) else {
+        return Some(AsyncFlipBlocker::NoDirectScanout);
+    };
+    if !current
+        .and_then(|current| current.config)
+        .is_some_and(|(_, current)| current.is_compatible(&properties))
+    {
+        return Some(AsyncFlipBlocker::PrimaryChanged);
+    }
+    if other_plane_changed {
+        return Some(AsyncFlipBlocker::OtherPlaneChanged);
+    }
+    None
+}
+
+/// How a frame was page-flipped, see [`flip_frame`]
+#[derive(Debug)]
+struct FlipOutcome {
+    result: Result<(), DrmError>,
+    presentation_mode: PresentationMode,
+    async_refused: bool,
+}
+
+/// Page-flips a frame that needs no full commit, with an async page flip if `try_async`, and at
+/// the next vertical blank otherwise. `flip` commits the frame in the given mode.
+///
+/// If the kernel refuses the async commit with `EINVAL` (the property and driver checks), the
+/// frame is flipped vsynced at once, so it is not lost, and the refusal is not returned: it never
+/// reaches `handle_flip`, which would rule out direct scan-out of the element on the primary plane
+/// for the next frames. Any other error of the async commit is returned as it is, `EBUSY` (a
+/// previous commit still in flight) included, since a vsynced non-blocking commit would get it too.
+fn flip_frame(
+    try_async: bool,
+    mut flip: impl FnMut(PresentationMode) -> Result<(), DrmError>,
+) -> FlipOutcome {
+    let mut async_refused = false;
+    if try_async {
+        match flip(PresentationMode::Async) {
+            Err(err) if err.is_invalid_argument() => {
+                debug!(?err, "async page flip refused, flipping at the next vblank");
+                async_refused = true;
+            }
+            result => {
+                return FlipOutcome {
+                    presentation_mode: if result.is_ok() {
+                        PresentationMode::Async
+                    } else {
+                        PresentationMode::VSync
+                    },
+                    result,
+                    async_refused,
+                };
+            }
+        }
+    }
+    FlipOutcome {
+        result: flip(PresentationMode::VSync),
+        presentation_mode: PresentationMode::VSync,
+        async_refused,
     }
 }
 
@@ -1688,7 +1924,7 @@ where
         renderer: &mut R,
         elements: &'a [E],
         clear_color: impl Into<Color32F>,
-        frame_flags: FrameFlags,
+        mut frame_flags: FrameFlags,
     ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
     where
         E: RenderElement<R>,
@@ -1696,6 +1932,12 @@ where
         R::TextureId: Texture + 'static,
     {
         let mut clear_color = clear_color.into();
+
+        // An async page flip can only change the primary plane
+        let async_page_flip = frame_flags.contains(FrameFlags::ALLOW_ASYNC_PAGE_FLIP);
+        if async_page_flip {
+            frame_flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
+        }
 
         if !self.surface.is_active() {
             return Err(RenderFrameErrorType::<A, F, R>::PrepareFrame(
@@ -2400,6 +2642,7 @@ where
                 PreparedFrameKind::Full
             },
             frame: next_frame_state,
+            async_page_flip,
         };
         let frame_reference: RenderFrameResult<'a, A::Buffer, F::Framebuffer, E> = RenderFrameResult {
             is_empty: next_frame.is_empty(),
@@ -2545,14 +2788,38 @@ where
         } = self.queued_frame.take().unwrap();
 
         let allow_partial_update = prepared_frame.kind == PreparedFrameKind::Partial;
-        let flip = if self.surface.commit_pending() {
-            prepared_frame
-                .frame
-                .commit(&self.surface, self.supports_fencing, allow_partial_update, true)
+        let FlipOutcome {
+            result: flip,
+            presentation_mode,
+            async_refused,
+        } = if self.surface.commit_pending() {
+            FlipOutcome {
+                result: prepared_frame.frame.commit(
+                    &self.surface,
+                    self.supports_fencing,
+                    allow_partial_update,
+                    true,
+                ),
+                presentation_mode: PresentationMode::VSync,
+                async_refused: false,
+            }
         } else {
-            prepared_frame
-                .frame
-                .page_flip(&self.surface, self.supports_fencing, allow_partial_update, true)
+            let try_async = prepared_frame.async_page_flip
+                && match self.async_flip_blocker(&prepared_frame) {
+                    Some(blocker) => {
+                        trace!(?blocker, "no async page flip, flipping at the next vblank");
+                        false
+                    }
+                    None => true,
+                };
+            let (surface, supports_fencing) = (&self.surface, self.supports_fencing);
+            let frame = &mut prepared_frame.frame;
+            flip_frame(try_async, |mode| match mode {
+                PresentationMode::Async => frame.page_flip_async(surface, surface.plane()),
+                PresentationMode::VSync => {
+                    frame.page_flip(surface, supports_fencing, allow_partial_update, true)
+                }
+            })
         };
 
         let res = self.handle_flip(&prepared_frame, flip);
@@ -2561,10 +2828,30 @@ where
             self.pending_frame = Some(PendingFrame {
                 frame: prepared_frame.frame,
                 user_data,
+                presentation_mode,
+                async_refused,
             });
         }
 
         res
+    }
+
+    fn async_flip_blocker(&self, prepared_frame: &PreparedFrame<A, F>) -> Option<AsyncFlipBlocker> {
+        let surface = AsyncFlipSurface {
+            supported: self.surface.supports_async_page_flip(),
+            full_commit: prepared_frame.kind == PreparedFrameKind::Full,
+            vrr_commit_pending: self.surface.vrr_commit_pending(),
+        };
+        let on_screen = self
+            .pending_frame
+            .as_ref()
+            .map(|pending| &pending.frame)
+            .unwrap_or(&self.current_frame);
+        async_flip_blocker(
+            surface,
+            self.surface.plane(),
+            prepared_frame.frame.async_flip_planes(on_screen),
+        )
     }
 
     fn handle_flip(
@@ -2609,6 +2896,24 @@ where
         flip.map_err(FrameError::DrmError)
     }
 
+    /// Returns the frame that was committed and waits for its page flip, if any.
+    ///
+    /// After [`queue_frame`](DrmCompositor::queue_frame) (or a [`frame_submitted`](DrmCompositor::frame_submitted)
+    /// that submitted a queued frame) this tells how that frame went out, see
+    /// [`FrameFlags::ALLOW_ASYNC_PAGE_FLIP`]. Read it before `frame_submitted` to know how the
+    /// frame whose page flip event just arrived was presented.
+    ///
+    /// The event of an async page flip arrives and has to be handled like any other, but the
+    /// kernel stamps it with the time and sequence of the last vertical blank, not of the flip
+    /// (see [`DrmSurface::page_flip_async`]).
+    pub fn pending_frame(&self) -> Option<FrameRef<'_, U>> {
+        self.pending_frame.as_ref().map(|frame| FrameRef {
+            user_data: &frame.user_data,
+            presentation_mode: frame.presentation_mode,
+            async_refused: frame.async_refused,
+        })
+    }
+
     /// Marks the current frame as submitted.
     ///
     /// *Note*: Needs to be called, after the vblank event of the matching [`DrmDevice`](super::DrmDevice)
@@ -2616,7 +2921,10 @@ where
     /// Otherwise the underlying swapchain will run out of buffers eventually.
     #[profiling::function]
     pub fn frame_submitted(&mut self) -> FrameResult<Option<U>, A, F> {
-        if let Some(PendingFrame { mut frame, user_data }) = self.pending_frame.take() {
+        if let Some(PendingFrame {
+            mut frame, user_data, ..
+        }) = self.pending_frame.take()
+        {
             std::mem::swap(&mut frame, &mut self.current_frame);
             if self.queued_frame.is_some() {
                 self.submit()?;
@@ -4442,4 +4750,356 @@ fn drm_compositor_is_send() {
 
     is_send::<DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>>(
     );
+}
+
+#[cfg(test)]
+mod async_flip_tests {
+    use std::cell::RefCell;
+
+    use drm::control::{RawResourceHandle, from_u32, plane};
+    use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
+    use rustix::io::Errno;
+
+    use super::{
+        AsyncFlipBlocker, AsyncFlipPlane, AsyncFlipSurface, FlipOutcome, PlaneProperties, async_flip_blocker,
+        flip_frame,
+    };
+    use crate::{
+        backend::{
+            drm::{DrmError, error::AccessError},
+            renderer::PresentationMode,
+        },
+        utils::{Rectangle, Transform},
+    };
+
+    fn handle<T: From<RawResourceHandle>>(raw: u32) -> T {
+        from_u32(raw).unwrap()
+    }
+
+    const PRIMARY: u32 = 1;
+    const CURSOR: u32 = 2;
+    const OVERLAY: u32 = 3;
+
+    fn properties() -> PlaneProperties {
+        PlaneProperties {
+            src: Rectangle::from_size((2560.0, 1440.0).into()),
+            dst: Rectangle::from_size((2560, 1440).into()),
+            transform: Transform::Normal,
+            alpha: 1.0,
+            format: DrmFormat {
+                code: DrmFourcc::Xrgb2101010,
+                modifier: DrmModifier::Linear,
+            },
+        }
+    }
+
+    /// A client buffer scanned out directly
+    fn client(raw_fb: u32) -> AsyncFlipPlane {
+        AsyncFlipPlane {
+            config: Some((handle(raw_fb), properties())),
+            skip: false,
+            client_buffer: true,
+        }
+    }
+
+    fn unused() -> AsyncFlipPlane {
+        AsyncFlipPlane {
+            config: None,
+            skip: true,
+            client_buffer: false,
+        }
+    }
+
+    fn cursor(x: i32, skip: bool) -> AsyncFlipPlane {
+        AsyncFlipPlane {
+            config: Some((
+                handle(100),
+                PlaneProperties {
+                    src: Rectangle::from_size((64.0, 64.0).into()),
+                    dst: Rectangle::new((x, 10).into(), (64, 64).into()),
+                    ..properties()
+                },
+            )),
+            skip,
+            client_buffer: false,
+        }
+    }
+
+    /// A surface that allows async page flips
+    fn surface() -> AsyncFlipSurface {
+        AsyncFlipSurface {
+            supported: true,
+            full_commit: false,
+            vrr_commit_pending: false,
+        }
+    }
+
+    type Planes = Vec<(plane::Handle, Option<AsyncFlipPlane>, AsyncFlipPlane)>;
+
+    /// The planes of a frame with this primary plane (on screen, next), an unused overlay plane
+    /// and these other planes
+    fn planes(
+        primary: (Option<AsyncFlipPlane>, AsyncFlipPlane),
+        others: impl IntoIterator<Item = (u32, Option<AsyncFlipPlane>, AsyncFlipPlane)>,
+    ) -> Planes {
+        let mut planes: Planes = vec![(handle(OVERLAY), Some(unused()), unused())];
+        planes.extend(
+            others
+                .into_iter()
+                .map(|(raw, current, next)| (handle(raw), current, next)),
+        );
+        // The primary plane is not the first one
+        planes.push((handle(PRIMARY), primary.0, primary.1));
+        planes
+    }
+
+    fn blocker(surface: AsyncFlipSurface, planes: Planes) -> Option<AsyncFlipBlocker> {
+        async_flip_blocker(surface, handle(PRIMARY), planes)
+    }
+
+    #[test]
+    fn a_new_buffer_on_an_unchanged_primary_plane_flips_async() {
+        let primary = (Some(client(1)), client(2));
+        assert_eq!(blocker(surface(), planes(primary, [])), None);
+        // A cursor that is in use but neither moves nor changes
+        let still_cursor = (CURSOR, Some(cursor(10, true)), cursor(10, true));
+        assert_eq!(blocker(surface(), planes(primary, [still_cursor])), None);
+        // What was on screen before does not have to be a client buffer
+        let composited = AsyncFlipPlane {
+            client_buffer: false,
+            ..client(1)
+        };
+        assert_eq!(
+            blocker(surface(), planes((Some(composited), client(2)), [])),
+            None
+        );
+    }
+
+    #[test]
+    fn the_surface_has_to_allow_async_flips() {
+        let primary = (Some(client(1)), client(2));
+        let cases = [
+            (
+                AsyncFlipSurface {
+                    supported: false,
+                    ..surface()
+                },
+                AsyncFlipBlocker::Unsupported,
+            ),
+            (
+                AsyncFlipSurface {
+                    full_commit: true,
+                    ..surface()
+                },
+                AsyncFlipBlocker::FullCommit,
+            ),
+            // `use_vrr` switched VRR without a modeset: the next flip has to send `VRR_ENABLED`
+            (
+                AsyncFlipSurface {
+                    vrr_commit_pending: true,
+                    ..surface()
+                },
+                AsyncFlipBlocker::VrrChange,
+            ),
+        ];
+        for (surface, expected) in cases {
+            assert_eq!(
+                blocker(surface, planes(primary, [])),
+                Some(expected),
+                "{surface:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_primary_plane_must_scan_out_a_client_buffer() {
+        let composited = AsyncFlipPlane {
+            client_buffer: false,
+            ..client(2)
+        };
+        for next in [composited, unused()] {
+            assert_eq!(
+                blocker(surface(), planes((Some(client(1)), next), [])),
+                Some(AsyncFlipBlocker::NoDirectScanout),
+                "{next:?}"
+            );
+        }
+        // No primary plane in the frame at all
+        let without_primary = vec![(handle(OVERLAY), Some(unused()), unused())];
+        assert_eq!(
+            blocker(surface(), without_primary),
+            Some(AsyncFlipBlocker::NoDirectScanout)
+        );
+    }
+
+    #[test]
+    fn the_primary_plane_may_change_nothing_but_the_framebuffer() {
+        let with = |properties: PlaneProperties| AsyncFlipPlane {
+            config: Some((handle(2), properties)),
+            ..client(2)
+        };
+        let changed = [
+            with(PlaneProperties {
+                src: Rectangle::from_size((1920.0, 1080.0).into()),
+                ..properties()
+            }),
+            with(PlaneProperties {
+                dst: Rectangle::new((0, 1).into(), (2560, 1440).into()),
+                ..properties()
+            }),
+            with(PlaneProperties {
+                transform: Transform::_180,
+                ..properties()
+            }),
+            with(PlaneProperties {
+                alpha: 0.5,
+                ..properties()
+            }),
+            with(PlaneProperties {
+                format: DrmFormat {
+                    code: DrmFourcc::Xrgb8888,
+                    modifier: DrmModifier::Linear,
+                },
+                ..properties()
+            }),
+            with(PlaneProperties {
+                format: DrmFormat {
+                    code: DrmFourcc::Xrgb2101010,
+                    modifier: DrmModifier::from(0x0200_0000_0000_0001u64),
+                },
+                ..properties()
+            }),
+        ];
+        for next in changed {
+            assert_eq!(
+                blocker(surface(), planes((Some(client(1)), next), [])),
+                Some(AsyncFlipBlocker::PrimaryChanged),
+                "{next:?}"
+            );
+        }
+        // Nothing on screen yet
+        for current in [Some(unused()), None] {
+            assert_eq!(
+                blocker(surface(), planes((current, client(2)), [])),
+                Some(AsyncFlipBlocker::PrimaryChanged)
+            );
+        }
+    }
+
+    #[test]
+    fn no_other_plane_may_change() {
+        let changes = [
+            // A new cursor image
+            (Some(cursor(10, true)), cursor(10, false)),
+            // A cursor move skipped by `SKIP_CURSOR_ONLY_UPDATES` still changes the plane
+            (Some(cursor(10, true)), cursor(11, true)),
+            // A plane is turned on, or off
+            (Some(unused()), cursor(10, false)),
+            (
+                Some(cursor(10, true)),
+                AsyncFlipPlane {
+                    skip: false,
+                    ..unused()
+                },
+            ),
+        ];
+        for (current, next) in changes {
+            assert_eq!(
+                blocker(
+                    surface(),
+                    planes((Some(client(1)), client(2)), [(CURSOR, current, next)])
+                ),
+                Some(AsyncFlipBlocker::OtherPlaneChanged),
+                "{next:?}"
+            );
+        }
+    }
+
+    fn error(errno: Errno) -> DrmError {
+        DrmError::Access(AccessError {
+            errmsg: "Page flip commit failed",
+            dev: None,
+            source: errno.into(),
+        })
+    }
+
+    fn errno(result: &Result<(), DrmError>) -> Option<Errno> {
+        match result {
+            Err(DrmError::Access(access)) => Errno::from_io_error(&access.source),
+            _ => None,
+        }
+    }
+
+    /// Runs `flip_frame` against a kernel that answers the async commit with `async_result` and
+    /// the vsynced one with `vsync_result`, and returns the outcome and the commits made
+    fn flip(
+        try_async: bool,
+        async_result: Option<Errno>,
+        vsync_result: Option<Errno>,
+    ) -> (FlipOutcome, Vec<PresentationMode>) {
+        let commits = RefCell::new(Vec::new());
+        let outcome = flip_frame(try_async, |mode| {
+            commits.borrow_mut().push(mode);
+            let result = match mode {
+                PresentationMode::Async => async_result,
+                PresentationMode::VSync => vsync_result,
+            };
+            result.map_or(Ok(()), |errno| Err(error(errno)))
+        });
+        (outcome, commits.into_inner())
+    }
+
+    #[test]
+    fn a_frame_without_async_flips_vsynced() {
+        let (outcome, commits) = flip(false, None, None);
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.presentation_mode, PresentationMode::VSync);
+        assert!(!outcome.async_refused);
+        assert_eq!(commits, [PresentationMode::VSync]);
+
+        let (outcome, commits) = flip(false, None, Some(Errno::INVAL));
+        assert_eq!(errno(&outcome.result), Some(Errno::INVAL));
+        assert!(!outcome.async_refused);
+        assert_eq!(commits, [PresentationMode::VSync]);
+    }
+
+    #[test]
+    fn an_accepted_async_flip_is_presented_async() {
+        let (outcome, commits) = flip(true, None, None);
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.presentation_mode, PresentationMode::Async);
+        assert!(!outcome.async_refused);
+        assert_eq!(commits, [PresentationMode::Async]);
+    }
+
+    #[test]
+    fn a_refused_async_flip_is_flipped_vsynced_at_once() {
+        let (outcome, commits) = flip(true, Some(Errno::INVAL), None);
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.presentation_mode, PresentationMode::VSync);
+        assert!(outcome.async_refused);
+        assert_eq!(commits, [PresentationMode::Async, PresentationMode::VSync]);
+
+        // The error of the vsynced flip is the one returned
+        let (outcome, commits) = flip(true, Some(Errno::INVAL), Some(Errno::NOMEM));
+        assert_eq!(errno(&outcome.result), Some(Errno::NOMEM));
+        assert_eq!(outcome.presentation_mode, PresentationMode::VSync);
+        assert!(outcome.async_refused);
+        assert_eq!(commits, [PresentationMode::Async, PresentationMode::VSync]);
+    }
+
+    #[test]
+    fn other_errors_of_the_async_flip_are_returned() {
+        // `EBUSY`: a vsynced non-blocking commit would get it as well
+        for errno_ in [Errno::BUSY, Errno::ACCESS, Errno::PERM, Errno::NOMEM] {
+            let (outcome, commits) = flip(true, Some(errno_), None);
+            assert_eq!(errno(&outcome.result), Some(errno_));
+            assert_eq!(outcome.presentation_mode, PresentationMode::VSync);
+            assert!(!outcome.async_refused);
+            assert_eq!(commits, [PresentationMode::Async]);
+        }
+        let outcome = flip_frame(true, |_| Err(DrmError::DeviceInactive));
+        assert!(matches!(outcome.result, Err(DrmError::DeviceInactive)));
+        assert!(!outcome.async_refused);
+    }
 }

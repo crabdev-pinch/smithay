@@ -26,7 +26,7 @@ use crate::{
 use super::{
     DrmDevice, DrmError, Planes,
     compositor::{
-        DrmCompositor, FrameError, FrameFlags, FrameResult, PrimaryPlaneElement, RenderFrameError,
+        DrmCompositor, FrameError, FrameFlags, FrameRef, FrameResult, PrimaryPlaneElement, RenderFrameError,
         RenderFrameErrorType, RenderFrameResult,
     },
     exporter::ExportFramebuffer,
@@ -669,6 +669,15 @@ where
     /// Reset the underlying buffers
     pub fn reset_buffers(&self) {
         self.with_compositor(|compositor| compositor.reset_buffers());
+    }
+
+    /// Access the frame that was committed and waits for its page flip,
+    /// see [`DrmCompositor::pending_frame`]
+    pub fn with_pending_frame<T, R>(&self, f: T) -> R
+    where
+        T: FnOnce(Option<FrameRef<'_, U>>) -> R,
+    {
+        self.with_compositor(|compositor| f(compositor.pending_frame()))
     }
 
     /// Marks the current frame as submitted.
