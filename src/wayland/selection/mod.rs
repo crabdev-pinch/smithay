@@ -52,6 +52,25 @@ pub trait SelectionHandler: Sized + SeatHandler {
     }
 }
 
+/// Keeps the `ty` selection that a client is setting from data control devices (clipboard
+/// managers), or not: they are told there is no selection while it lasts. Call it from
+/// [`SelectionHandler::new_selection`], which runs before the selection is offered; the
+/// decision holds until the next selection, and a selection the compositor sets (or none)
+/// is never hidden.
+pub fn set_data_control_hidden<D>(seat: &Seat<D>, ty: SelectionTarget, hidden: bool)
+where
+    D: SelectionHandler + 'static,
+{
+    seat.user_data()
+        .insert_if_missing(|| std::cell::RefCell::new(seat_data::SeatData::<D::SelectionUserData>::new()));
+    if let Some(seat_data) = seat
+        .user_data()
+        .get::<std::cell::RefCell<seat_data::SeatData<D::SelectionUserData>>>()
+    {
+        seat_data.borrow_mut().set_hidden(ty, hidden);
+    }
+}
+
 /// The target for the selection request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionTarget {
