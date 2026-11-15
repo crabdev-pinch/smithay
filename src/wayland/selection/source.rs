@@ -25,6 +25,21 @@ impl SelectionSource {
     pub fn mime_types(&self) -> Vec<String> {
         self.provider.mime_types()
     }
+
+    /// Whether a data control client (a clipboard manager) offers this selection, rather than
+    /// an ordinary client through the data device or the primary selection.
+    pub fn is_data_control(&self) -> bool {
+        matches!(
+            self.provider,
+            SelectionSourceProvider::WlrDataControl(_) | SelectionSourceProvider::ExtDataControl(_)
+        )
+    }
+
+    /// The client that offers this selection, while it is connected.
+    pub fn client(&self) -> Option<wayland_server::Client> {
+        let provider = &self.provider;
+        selection_dispatch!(provider; SelectionSourceProvider(source) => source.client())
+    }
 }
 
 /// Provider of the selection data.

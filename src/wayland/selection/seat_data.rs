@@ -15,6 +15,10 @@ pub(crate) struct SeatData<U: Clone + Sync + Send + 'static> {
     clipboard_selection_focus: Option<Client>,
     primary_selection: Option<OfferReplySource<U>>,
     primary_selection_focus: Option<Client>,
+    /// The current clipboard selection is not offered to data control devices.
+    clipboard_hidden: bool,
+    /// The current primary selection is not offered to data control devices.
+    primary_hidden: bool,
 }
 
 impl<U: Clone + Send + Sync + 'static> SeatData<U> {
@@ -30,6 +34,15 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
     /// Register a new [SelectionDevice] into [SeatData].
     pub fn add_device(&mut self, device: SelectionDevice) {
         self.known_devices.push(device);
+    }
+
+    /// Whether data control devices are kept from the next `ty` selection set by a client (see
+    /// [`set_data_control_hidden`](super::set_data_control_hidden)).
+    pub fn set_hidden(&mut self, ty: SelectionTarget, hidden: bool) {
+        match ty {
+            SelectionTarget::Clipboard => self.clipboard_hidden = hidden,
+            SelectionTarget::Primary => self.primary_hidden = hidden,
+        }
     }
 
     /// Get the iterator over [`WlDataDevice`]. Mostly used for the drag and drop handling.
@@ -69,6 +82,11 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
                 _ => source.cancel(),
             }
         }
+        // A compositor selection, or none, is never hidden; a client's keeps what the
+        // compositor decided in `new_selection`.
+        if !matches!(new_selection, Some(OfferReplySource::Client(_))) {
+            self.clipboard_hidden = false;
+        }
         self.clipboard_selection = new_selection;
         self.send_selection::<D>(dh, SelectionTarget::Clipboard, None, true)
     }
@@ -98,6 +116,9 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
                 Some(OfferReplySource::Client(new_source)) if new_source == source => (),
                 _ => source.cancel(),
             }
+        }
+        if !matches!(new_selection, Some(OfferReplySource::Client(_))) {
+            self.primary_hidden = false;
         }
         self.primary_selection = new_selection;
         self.send_selection::<D>(dh, SelectionTarget::Primary, None, true)
@@ -131,11 +152,16 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
     ) where
         D: SelectionHandler<SelectionUserData = U> + 'static,
     {
-        let (client, selection) = match ty {
-            SelectionTarget::Primary => (self.primary_selection_focus.as_ref(), &mut self.primary_selection),
+        let (client, selection, hidden) = match ty {
+            SelectionTarget::Primary => (
+                self.primary_selection_focus.as_ref(),
+                &mut self.primary_selection,
+                self.primary_hidden,
+            ),
             SelectionTarget::Clipboard => (
                 self.clipboard_selection_focus.as_ref(),
                 &mut self.clipboard_selection,
+                self.clipboard_hidden,
             ),
         };
 
@@ -170,7 +196,18 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
                 continue;
             }
 
-            match (&*selection, ty) {
+            let is_data_control = matches!(
+                device,
+                SelectionDevice::WlrDataControl(_) | SelectionDevice::ExtDataControl(_)
+            );
+            // A hidden selection reaches data control devices as no selection at all.
+            let selection_for_device = if hidden && is_data_control {
+                &None
+            } else {
+                &*selection
+            };
+
+            match (selection_for_device, ty) {
                 (None, SelectionTarget::Primary) => {
                     device.unset_primary_selection();
                     continue;
@@ -223,6 +260,8 @@ impl<U: Clone + Send + Sync + 'static> Default for SeatData<U> {
             clipboard_selection_focus: None,
             primary_selection: None,
             primary_selection_focus: None,
+            clipboard_hidden: false,
+            primary_hidden: false,
         }
     }
 }
