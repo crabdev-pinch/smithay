@@ -796,6 +796,20 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
             .plane_state(primary)
             .and_then(|state| state.config.as_ref())
             .ok_or(crate::backend::drm::error::Error::NoFramebuffer(primary))?;
+        if matches!(config.buffer.buffer, ScanoutBuffer::Swapchain(_)) {
+            // A composited frame (`ALLOW_ASYNC_PAGE_FLIP_COMPOSITED`): the commit carries no fence,
+            // so the rendering has to be done before the kernel may scan the buffer out
+            if let Some((sync, _)) = config.sync.as_ref() {
+                sync.wait().map_err(|_| {
+                    crate::backend::drm::error::Error::Access(crate::backend::drm::error::AccessError {
+                        errmsg: "Waiting for the rendering of an async page flip was interrupted",
+                        dev: surface.dev_path(),
+                        source: std::io::Error::from(std::io::ErrorKind::Interrupted),
+                    })
+                })?;
+            }
+            return surface.page_flip_async(*config.buffer.as_ref(), None);
+        }
         // The fence a vsynced flip of this frame would set as `IN_FENCE_FD` (see `build_planes`)
         let fence = config
             .sync
@@ -1044,6 +1058,8 @@ struct PreparedFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer
     kind: PreparedFrameKind,
     /// Rendered with [`FrameFlags::ALLOW_ASYNC_PAGE_FLIP`]
     async_page_flip: bool,
+    /// Rendered with [`FrameFlags::ALLOW_ASYNC_PAGE_FLIP_COMPOSITED`] too
+    async_composited: bool,
 }
 
 impl<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>> PreparedFrame<A, F> {
@@ -1067,6 +1083,7 @@ where
             .field("frame", &self.frame)
             .field("kind", &self.kind)
             .field("async_page_flip", &self.async_page_flip)
+            .field("async_composited", &self.async_composited)
             .finish()
     }
 }
@@ -1116,6 +1133,22 @@ bitflags::bitflags! {
         /// The flag applies to the frame rendered with it only. Without it nothing changes, and
         /// the legacy api ignores it.
         const ALLOW_ASYNC_PAGE_FLIP = 32;
+        /// With [`FrameFlags::ALLOW_ASYNC_PAGE_FLIP`]: a frame whose primary plane shows the
+        /// composited swapchain buffer may flip async as well, not only one that scans out a client
+        /// buffer directly. Every other rule of [`FrameFlags::ALLOW_ASYNC_PAGE_FLIP`] still applies:
+        /// the swapchain buffer has to fit the primary plane on screen (it does from the second
+        /// composited frame on, as long as the mode and the swapchain's format stay), and no other
+        /// plane may change, so a cursor that moves on the cursor plane makes the frame flip at the
+        /// next vertical blank (leave out [`FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT`] to draw the
+        /// cursor into the frame instead).
+        ///
+        /// The async commit of a swapchain buffer carries no `IN_FENCE_FD` (Linux 6.8 to 6.10 refuse
+        /// one, and implicit fencing of the buffer is not something every driver provides), so the
+        /// submit waits on the CPU until the rendering of the frame has finished before it commits:
+        /// [`DrmCompositor::queue_frame`] blocks for that long. The buffer is complete when the
+        /// kernel scans it out either way. Without [`FrameFlags::ALLOW_ASYNC_PAGE_FLIP`] this flag
+        /// does nothing.
+        const ALLOW_ASYNC_PAGE_FLIP_COMPOSITED = 64;
         /// Allow to realize the frame by assigning elements on any plane
         const ALLOW_SCANOUT = Self::ALLOW_PRIMARY_PLANE_SCANOUT.bits() | Self::ALLOW_OVERLAY_PLANE_SCANOUT.bits() | Self::ALLOW_CURSOR_PLANE_SCANOUT.bits();
         /// Safe default set of flags
@@ -1150,7 +1183,8 @@ enum AsyncFlipBlocker {
     /// A VRR switch (or a reset of the surface) still has to be committed, which an async commit
     /// cannot do
     VrrChange,
-    /// The primary plane is composited or off
+    /// The primary plane is off, or composited without
+    /// [`FrameFlags::ALLOW_ASYNC_PAGE_FLIP_COMPOSITED`]
     NoDirectScanout,
     /// The primary plane changes more than its framebuffer
     PrimaryChanged,
@@ -1167,6 +1201,9 @@ struct AsyncFlipSurface {
     full_commit: bool,
     /// `VRR_ENABLED` still has to be committed, see `DrmSurface::vrr_commit_pending`
     vrr_commit_pending: bool,
+    /// The frame may flip async with the composited swapchain buffer on the primary plane
+    /// ([`FrameFlags::ALLOW_ASYNC_PAGE_FLIP_COMPOSITED`])
+    composited: bool,
 }
 
 /// One plane of a frame, as far as async page flips are concerned
@@ -1181,8 +1218,9 @@ struct AsyncFlipPlane {
 }
 
 /// Checks whether a frame can be committed as an async page flip on top of the frame on screen:
-/// the surface allows it, the `primary` plane changes nothing but the framebuffer, and no other
-/// plane changes at all. Each plane is given as `(handle, on screen, next)`.
+/// the surface allows it, the `primary` plane scans out a client buffer (or the swapchain, if
+/// `surface.composited`) and changes nothing but the framebuffer, and no other plane changes at
+/// all. Each plane is given as `(handle, on screen, next)`.
 fn async_flip_blocker(
     surface: AsyncFlipSurface,
     primary: plane::Handle,
@@ -1215,7 +1253,7 @@ fn async_flip_blocker(
     let Some((current, next)) = primary_plane else {
         return Some(AsyncFlipBlocker::NoDirectScanout);
     };
-    let Some((_, properties)) = next.config.filter(|_| next.client_buffer) else {
+    let Some((_, properties)) = next.config.filter(|_| next.client_buffer || surface.composited) else {
         return Some(AsyncFlipBlocker::NoDirectScanout);
     };
     if !current
@@ -1935,6 +1973,8 @@ where
 
         // An async page flip can only change the primary plane
         let async_page_flip = frame_flags.contains(FrameFlags::ALLOW_ASYNC_PAGE_FLIP);
+        let async_composited =
+            async_page_flip && frame_flags.contains(FrameFlags::ALLOW_ASYNC_PAGE_FLIP_COMPOSITED);
         if async_page_flip {
             frame_flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
         }
@@ -2643,6 +2683,7 @@ where
             },
             frame: next_frame_state,
             async_page_flip,
+            async_composited,
         };
         let frame_reference: RenderFrameResult<'a, A::Buffer, F::Framebuffer, E> = RenderFrameResult {
             is_empty: next_frame.is_empty(),
@@ -2841,6 +2882,7 @@ where
             supported: self.surface.supports_async_page_flip(),
             full_commit: prepared_frame.kind == PreparedFrameKind::Full,
             vrr_commit_pending: self.surface.vrr_commit_pending(),
+            composited: prepared_frame.async_composited,
         };
         let on_screen = self
             .pending_frame
@@ -4831,6 +4873,7 @@ mod async_flip_tests {
             supported: true,
             full_commit: false,
             vrr_commit_pending: false,
+            composited: false,
         }
     }
 
@@ -4908,6 +4951,61 @@ mod async_flip_tests {
                 Some(expected),
                 "{surface:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_composited_frame_flips_async_only_when_allowed() {
+        let swapchain = |raw_fb: u32| AsyncFlipPlane {
+            client_buffer: false,
+            ..client(raw_fb)
+        };
+        let composited = AsyncFlipSurface {
+            composited: true,
+            ..surface()
+        };
+        let primary = (Some(swapchain(1)), swapchain(2));
+        assert_eq!(
+            blocker(surface(), planes(primary, [])),
+            Some(AsyncFlipBlocker::NoDirectScanout)
+        );
+        assert_eq!(blocker(composited, planes(primary, [])), None);
+        // A client buffer still flips async with the flag
+        assert_eq!(
+            blocker(composited, planes((Some(client(1)), client(2)), [])),
+            None
+        );
+        // Every other rule still holds: an unchanged cursor is fine, a moved one is not
+        let still_cursor = (CURSOR, Some(cursor(10, true)), cursor(10, true));
+        assert_eq!(blocker(composited, planes(primary, [still_cursor])), None);
+        let moved_cursor = (CURSOR, Some(cursor(10, true)), cursor(11, false));
+        assert_eq!(
+            blocker(composited, planes(primary, [moved_cursor])),
+            Some(AsyncFlipBlocker::OtherPlaneChanged)
+        );
+        // The cursor plane switched off (the cursor is drawn into the frame from now on)
+        let cursor_off = (CURSOR, Some(cursor(10, true)), unused());
+        assert_eq!(
+            blocker(composited, planes(primary, [cursor_off])),
+            Some(AsyncFlipBlocker::OtherPlaneChanged)
+        );
+        // A primary plane that is off never flips async
+        assert_eq!(
+            blocker(composited, planes((Some(swapchain(1)), unused()), [])),
+            Some(AsyncFlipBlocker::NoDirectScanout)
+        );
+        // Neither does a full commit or a pending VRR switch
+        for surface in [
+            AsyncFlipSurface {
+                full_commit: true,
+                ..composited
+            },
+            AsyncFlipSurface {
+                vrr_commit_pending: true,
+                ..composited
+            },
+        ] {
+            assert!(blocker(surface, planes(primary, [])).is_some(), "{surface:?}");
         }
     }
 
