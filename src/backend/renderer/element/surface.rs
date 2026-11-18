@@ -241,6 +241,8 @@ pub struct WaylandSurfaceRenderElement<R: Renderer> {
     damage: DamageSnapshot<i32, BufferCoords>,
     opaque_regions: OpaqueRegions<i32, Logical>,
     texture: WaylandSurfaceTexture<R>,
+    /// Whether the buffer is what the element shows (see [`Self::with_texture`]).
+    shows_buffer: bool,
 }
 
 impl<R: Renderer> fmt::Debug for WaylandSurfaceRenderElement<R> {
@@ -320,6 +322,7 @@ impl<R: Renderer + ImportAll> WaylandSurfaceRenderElement<R> {
                 .map(OpaqueRegions::from_slice)
                 .unwrap_or_default(),
             texture,
+            shows_buffer: true,
         })
     }
 
@@ -348,6 +351,18 @@ impl<R: Renderer + ImportAll> WaylandSurfaceRenderElement<R> {
     /// Get the buffer
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
+    }
+
+    /// Draws `texture` in place of the buffer's texture, for example a copy of the buffer
+    /// converted to another color encoding. The texture must have the buffer's dimensions; the
+    /// element keeps its geometry, damage, opaque regions and transform.
+    ///
+    /// The element no longer offers the buffer for direct scanout, because what it shows is
+    /// not the buffer's content.
+    pub fn with_texture(mut self, texture: R::TextureId) -> Self {
+        self.texture = WaylandSurfaceTexture::Texture(texture);
+        self.shows_buffer = false;
+        self
     }
 }
 
@@ -444,7 +459,8 @@ where
 {
     #[inline]
     fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
-        Some(UnderlyingStorage::Wayland(&self.buffer))
+        self.shows_buffer
+            .then_some(UnderlyingStorage::Wayland(&self.buffer))
     }
 
     #[instrument(level = "trace", skip(frame))]
